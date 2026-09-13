@@ -1774,6 +1774,16 @@ class MeshCoreConnector extends ChangeNotifier {
     );
 
     await _awaitActiveDisconnect();
+    // The await is a suspension point: another connect may have claimed the
+    // connector while this one was waiting for the teardown.
+    if (_state == MeshCoreConnectionState.connecting ||
+        _state == MeshCoreConnectionState.connected) {
+      _appDebugLogService?.warn(
+        'connectUsb ignored: already $_state after disconnect wait',
+        tag: 'USB',
+      );
+      return;
+    }
 
     await stopScan();
     _cancelReconnectTimer();
@@ -1873,6 +1883,16 @@ class MeshCoreConnector extends ChangeNotifier {
     _appDebugLogService?.info('connectTcp: endpoint=$host:$port', tag: 'TCP');
 
     await _awaitActiveDisconnect();
+    // The await is a suspension point: another connect may have claimed the
+    // connector while this one was waiting for the teardown.
+    if (_state == MeshCoreConnectionState.connecting ||
+        _state == MeshCoreConnectionState.connected) {
+      _appDebugLogService?.warn(
+        'connectTcp ignored: already $_state after disconnect wait',
+        tag: 'TCP',
+      );
+      return;
+    }
 
     await stopScan();
     _cancelReconnectTimer();
@@ -2023,6 +2043,12 @@ class MeshCoreConnector extends ChangeNotifier {
     }
 
     await _awaitActiveDisconnect();
+    // The await is a suspension point: another connect may have claimed the
+    // connector while this one was waiting for the teardown.
+    if (_state == MeshCoreConnectionState.connecting ||
+        _state == MeshCoreConnectionState.connected) {
+      return;
+    }
 
     _activeTransport = MeshCoreTransportType.bluetooth;
 
@@ -2710,6 +2736,7 @@ class MeshCoreConnector extends ChangeNotifier {
   }
 
   bool get _shouldAutoReconnect =>
+      !_disposed &&
       !_manualDisconnect &&
       _lastDeviceId != null &&
       _activeTransport == MeshCoreTransportType.bluetooth;
@@ -2765,7 +2792,17 @@ class MeshCoreConnector extends ChangeNotifier {
     bool skipBleDeviceDisconnect = false,
   }) {
     final inFlight = _activeDisconnect;
-    if (inFlight != null) return inFlight;
+    if (inFlight != null) {
+      if (manual) {
+        // A teardown started as automatic must still honour a later manual
+        // request, otherwise _manualDisconnect stays false and its tail
+        // schedules an auto-reconnect the user did not ask for.
+        _manualDisconnect = true;
+        _cancelReconnectTimer();
+        unawaited(_backgroundService?.stop());
+      }
+      return inFlight;
+    }
     final teardown = _disconnectInternal(
       manual: manual,
       skipBleDeviceDisconnect: skipBleDeviceDisconnect,
