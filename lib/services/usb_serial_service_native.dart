@@ -35,6 +35,8 @@ class UsbSerialService {
   String? _connectedPortKey;
   String? _connectedPortLabel;
   FlSerial? _serial;
+  /// Non-null while the native port is being closed in a helper isolate.
+  Future<void>? _pendingNativeClose;
   AppDebugLogService? _debugLogService;
   Object? _lastError;
 
@@ -330,7 +332,15 @@ class UsbSerialService {
         // Ignore errors while closing.
       }
       if (serial != null) {
-        await _closePortOffUiIsolate(serial);
+        final pending = _closePortOffUiIsolate(serial);
+        _pendingNativeClose = pending;
+        try {
+          await pending;
+        } finally {
+          if (identical(_pendingNativeClose, pending)) {
+            _pendingNativeClose = null;
+          }
+        }
       }
       // Note: we do NOT call free() here; that would globally reset native
       // state for all ports. The global reset is done in connect() instead,
@@ -380,25 +390,37 @@ class UsbSerialService {
   /// replicated here afterwards.
   Future<void> _closePortOffUiIsolate(FlSerial serial) async {
     final flh = serial.flh;
+    if (flh < 0) {
+      // Already closed synchronously by dispose(); `closePort()` freed the
+      // native slot, the stream and both I/O buffers. Touching them again
+      // would double-free the calloc'd buffers.
+      return;
+    }
     serial.flh = -1;
-    if (flh >= 0) {
-      final startedAt = DateTime.now();
+    final startedAt = DateTime.now();
+    try {
+      await Isolate.run(() => bindings.fl_close(flh));
+    } catch (error) {
+      // Spawning the helper failed, so the native slot and its SerialThread
+      // are still alive with no reachable handle. Close it inline instead —
+      // that blocks, but only in this already-degraded path.
+      _debugLogService?.warn(
+        'Off-isolate USB port close failed ($error); closing inline',
+        tag: 'USB Serial',
+      );
       try {
-        await Isolate.run(() => bindings.fl_close(flh));
-      } catch (error) {
-        _debugLogService?.warn(
-          'Native USB port close failed: $error',
-          tag: 'USB Serial',
-        );
+        bindings.fl_close(flh);
+      } catch (_) {
+        // Ignore errors while closing.
       }
-      final elapsed = DateTime.now().difference(startedAt);
-      if (elapsed > const Duration(seconds: 1)) {
-        _debugLogService?.warn(
-          'Native USB port close took ${elapsed.inMilliseconds}ms — the device '
-          'was not draining its serial input',
-          tag: 'USB Serial',
-        );
-      }
+    }
+    final elapsed = DateTime.now().difference(startedAt);
+    if (elapsed > const Duration(seconds: 1)) {
+      _debugLogService?.warn(
+        'Native USB port close took ${elapsed.inMilliseconds}ms — the device '
+        'was not draining its serial input',
+        tag: 'USB Serial',
+      );
     }
     try {
       await serial.onSerialData.close();
@@ -421,14 +443,25 @@ class UsbSerialService {
     // disconnect() path via unawaited() offers no ordering guarantee — the
     // isolate may die before the Future resolves, leaving the thread alive
     // with a dangling NativeCallable pointer.
-    if (_useDesktopFlSerial) {
+    //
+    // When a close is already in flight there is nothing left to do
+    // synchronously: `fl_close()` sets `breakThread` and joins the
+    // SerialThread *before* it reaches the blocking `::close()`, so the
+    // thread — and with it the NativeCallable — is already gone while the
+    // helper isolate waits out the kernel's closing_wait.
+    if (_useDesktopFlSerial && _pendingNativeClose == null) {
       final serial = _serial;
+      _serial = null;
       try {
-        if (serial?.isOpen() == FlOpenStatus.open) {
-          serial?.setDTR(false);
-          serial?.closePort(); // synchronous C call — kills the SerialThread
+        if (serial != null && serial.isOpen() == FlOpenStatus.open) {
+          serial.setDTR(false);
+          serial.closePort(); // synchronous C call — kills the SerialThread
         }
       } catch (_) {}
+      // closePort() frees both I/O buffers but leaves the pointer fields
+      // dangling; clear them so nothing can free them a second time.
+      serial?.serialReadBuff = Pointer.fromAddress(0);
+      serial?.serialWriteBuff = Pointer.fromAddress(0);
     }
     // Kick off the full async teardown for anything else (subscription cancel,
     // stream controller close). These are best-effort at dispose time.
