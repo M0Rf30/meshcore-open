@@ -194,6 +194,10 @@ class MeshCoreConnector extends ChangeNotifier {
   /// waits out the kernel's closing_wait off the UI isolate, so the teardown
   /// can outlive the tap that starts the next connection.
   Future<void>? _activeDisconnect;
+  /// Set by [dispose]. A teardown started before disposal can still be running
+  /// (the USB native close waits out the kernel's closing_wait off the UI
+  /// isolate), so state publication is suppressed once the connector is gone.
+  bool _disposed = false;
   final MeshCoreUsbManager _usbManager = MeshCoreUsbManager();
   final LinuxBlePairingService _linuxBlePairingService =
       LinuxBlePairingService();
@@ -6944,6 +6948,7 @@ class MeshCoreConnector extends ChangeNotifier {
   }
 
   void _setState(MeshCoreConnectionState newState) {
+    if (_disposed) return;
     if (_state != newState) {
       _state = newState;
       notifyListeners();
@@ -6951,6 +6956,7 @@ class MeshCoreConnector extends ChangeNotifier {
   }
 
   void markNotifyDirty() {
+    if (_disposed) return;
     if (_notifyListenersDirty && _notifyListenersTimer != null) {
       return;
     }
@@ -6981,11 +6987,13 @@ class MeshCoreConnector extends ChangeNotifier {
 
   @override
   void notifyListeners() {
+    if (_disposed) return;
     markNotifyDirty();
   }
 
   @override
   void dispose() {
+    _disposed = true;
     _scanSubscription?.cancel();
     _isScanningSubscription?.cancel();
     _connectionSubscription?.cancel();

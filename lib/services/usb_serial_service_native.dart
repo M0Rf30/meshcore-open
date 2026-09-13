@@ -527,10 +527,12 @@ class UsbSerialService {
   }
 
   void _handleSerialData(FlSerialEventArgs event) {
-    if (_status != UsbSerialStatus.connected) {
+    if (_status == UsbSerialStatus.disconnecting ||
+        _status == UsbSerialStatus.disconnected) {
       // Teardown already invalidated the native handle; a callback queued
       // before that would make readList() throw and publish a spurious
-      // transport error that triggers another disconnect.
+      // transport error that triggers another disconnect. Data that arrives
+      // while still `connecting` is kept — the decoder buffers it.
       return;
     }
     try {
