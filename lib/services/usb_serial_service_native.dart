@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
+import 'package:ffi/ffi.dart';
 import 'package:flserial/flserial.dart';
 import 'package:flserial/flserial_exception.dart';
 import 'package:flutter/foundation.dart';
@@ -322,10 +325,12 @@ class UsbSerialService {
       try {
         if (serial?.isOpen() == FlOpenStatus.open) {
           serial?.setDTR(false);
-          serial?.closePort();
         }
       } catch (_) {
         // Ignore errors while closing.
+      }
+      if (serial != null) {
+        await _closePortOffUiIsolate(serial);
       }
       // Note: we do NOT call free() here; that would globally reset native
       // state for all ports. The global reset is done in connect() instead,
@@ -360,6 +365,54 @@ class UsbSerialService {
       basePortLabel: _connectedPortKey ?? trimmed,
       deviceName: trimmed,
     );
+  }
+
+  /// Closes the native port without blocking the Dart UI isolate.
+  ///
+  /// `close(2)` on a tty whose output has not been drained by the peer blocks
+  /// in the kernel for the line discipline's `closing_wait` (30s by default —
+  /// measured 30.4s on Linux with a CDC-ACM device that never reads its bulk
+  /// OUT endpoint, e.g. a MeshCore board flashed with a BLE-only companion
+  /// build). `FlSerial.closePort()` is a synchronous FFI call, so running it
+  /// inline freezes the whole app for that entire window. `fl_close()` only
+  /// touches process-global native state, so it is safe to run in a helper
+  /// isolate; the Dart-side cleanup that `closePort()` also performs is
+  /// replicated here afterwards.
+  Future<void> _closePortOffUiIsolate(FlSerial serial) async {
+    final flh = serial.flh;
+    serial.flh = -1;
+    if (flh >= 0) {
+      final startedAt = DateTime.now();
+      try {
+        await Isolate.run(() => bindings.fl_close(flh));
+      } catch (error) {
+        _debugLogService?.warn(
+          'Native USB port close failed: $error',
+          tag: 'USB Serial',
+        );
+      }
+      final elapsed = DateTime.now().difference(startedAt);
+      if (elapsed > const Duration(seconds: 1)) {
+        _debugLogService?.warn(
+          'Native USB port close took ${elapsed.inMilliseconds}ms — the device '
+          'was not draining its serial input',
+          tag: 'USB Serial',
+        );
+      }
+    }
+    try {
+      await serial.onSerialData.close();
+      if (serial.serialReadBuff.address != 0) {
+        calloc.free(serial.serialReadBuff);
+        serial.serialReadBuff = Pointer.fromAddress(0);
+      }
+      if (serial.serialWriteBuff.address != 0) {
+        calloc.free(serial.serialWriteBuff);
+        serial.serialWriteBuff = Pointer.fromAddress(0);
+      }
+    } catch (_) {
+      // Ignore errors while releasing Dart-side resources.
+    }
   }
 
   void dispose() {
