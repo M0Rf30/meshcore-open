@@ -188,6 +188,12 @@ class MeshCoreConnector extends ChangeNotifier {
   String? _lastDeviceId;
   String? _lastDeviceDisplayName;
   bool _manualDisconnect = false;
+  /// Non-null while [disconnect] is tearing the transport down. Connect paths
+  /// join it so a teardown cannot finish after a new connection and reset the
+  /// state to `disconnected`. USB made this reachable: its native close now
+  /// waits out the kernel's closing_wait off the UI isolate, so the teardown
+  /// can outlive the tap that starts the next connection.
+  Future<void>? _activeDisconnect;
   final MeshCoreUsbManager _usbManager = MeshCoreUsbManager();
   final LinuxBlePairingService _linuxBlePairingService =
       LinuxBlePairingService();
@@ -1763,6 +1769,8 @@ class MeshCoreConnector extends ChangeNotifier {
       tag: 'USB',
     );
 
+    await _awaitActiveDisconnect();
+
     await stopScan();
     _cancelReconnectTimer();
     _manualDisconnect = false;
@@ -1859,6 +1867,8 @@ class MeshCoreConnector extends ChangeNotifier {
     }
 
     _appDebugLogService?.info('connectTcp: endpoint=$host:$port', tag: 'TCP');
+
+    await _awaitActiveDisconnect();
 
     await stopScan();
     _cancelReconnectTimer();
@@ -2007,6 +2017,8 @@ class MeshCoreConnector extends ChangeNotifier {
         _state == MeshCoreConnectionState.connected) {
       return;
     }
+
+    await _awaitActiveDisconnect();
 
     _activeTransport = MeshCoreTransportType.bluetooth;
 
@@ -2747,8 +2759,41 @@ class MeshCoreConnector extends ChangeNotifier {
   Future<void> disconnect({
     bool manual = true,
     bool skipBleDeviceDisconnect = false,
+  }) {
+    final inFlight = _activeDisconnect;
+    if (inFlight != null) return inFlight;
+    final teardown = _disconnectInternal(
+      manual: manual,
+      skipBleDeviceDisconnect: skipBleDeviceDisconnect,
+    );
+    _activeDisconnect = teardown;
+    return teardown.whenComplete(() {
+      if (identical(_activeDisconnect, teardown)) {
+        _activeDisconnect = null;
+      }
+    });
+  }
+
+  /// Joins an in-flight [disconnect] so a new connection cannot be started
+  /// while the previous teardown is still running.
+  Future<void> _awaitActiveDisconnect() async {
+    final pending = _activeDisconnect;
+    if (pending == null) return;
+    _appDebugLogService?.info(
+      'Waiting for the in-flight disconnect to finish before connecting',
+      tag: 'Connection',
+    );
+    try {
+      await pending;
+    } catch (_) {
+      // Teardown failures are logged by the disconnect path.
+    }
+  }
+
+  Future<void> _disconnectInternal({
+    required bool manual,
+    required bool skipBleDeviceDisconnect,
   }) async {
-    if (_state == MeshCoreConnectionState.disconnecting) return;
     final transportAtDisconnect = _activeTransport;
     final transportLabel = switch (transportAtDisconnect) {
       MeshCoreTransportType.bluetooth => 'BLE',

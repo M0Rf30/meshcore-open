@@ -126,6 +126,26 @@ class UsbSerialService {
       throw UnsupportedError('USB serial is not supported on this platform.');
     }
 
+    // A previous disconnect may still be running: on desktop its native close
+    // waits out the kernel's closing_wait in a helper isolate, and the
+    // teardown only marks the transport disconnected afterwards. Reopening
+    // before it finishes would let the old teardown overwrite the new
+    // connection's state (and, on desktop, race fl_free()/fl_close() over the
+    // process-global flserial_tab). Wait for the whole teardown — on every
+    // platform — before claiming the `connecting` state.
+    final pendingDisconnect = _activeDisconnect;
+    if (pendingDisconnect != null) {
+      _debugLogService?.info(
+        'Waiting for the previous USB disconnect to finish before reopening',
+        tag: 'USB Serial',
+      );
+      try {
+        await pendingDisconnect;
+      } catch (_) {
+        // Failures are already logged by the teardown path.
+      }
+    }
+
     _status = UsbSerialStatus.connecting;
     var normalizedPortName = normalizeUsbPortName(portName);
     _frameDecoder.reset();
@@ -163,24 +183,7 @@ class UsbSerialService {
       //
       // This must happen before we register any new NativeCallable, so it must
       // be the very first thing we do in the desktop branch.
-      // A previous disconnect may still be running: its native close waits out
-      // the kernel's closing_wait in a helper isolate, and it only marks the
-      // transport disconnected afterwards. fl_close() and fl_free() mutate the
-      // same process-global flserial_tab, so reopening now could race the
-      // helper, and the old teardown could later overwrite the new connection
-      // state. Wait for the whole teardown, not just the native close.
-      final pendingDisconnect = _activeDisconnect;
-      if (pendingDisconnect != null) {
-        _debugLogService?.info(
-          'Waiting for the previous USB disconnect to finish before reopening',
-          tag: 'USB Serial',
-        );
-        try {
-          await pendingDisconnect;
-        } catch (_) {
-          // Failures are already logged by the teardown path.
-        }
-      }
+      // (the previous teardown was already awaited above)
 
       try {
         bindings.fl_free();
