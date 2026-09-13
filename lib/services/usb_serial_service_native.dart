@@ -162,6 +162,24 @@ class UsbSerialService {
       //
       // This must happen before we register any new NativeCallable, so it must
       // be the very first thing we do in the desktop branch.
+      // A previous close may still be running in its helper isolate (the
+      // kernel can hold close(2) for closing_wait). fl_close() and fl_free()
+      // mutate the same process-global flserial_tab, so opening — and
+      // especially resetting — the table now would race the helper and could
+      // double-close the old slot or kill the freshly opened one.
+      final pendingClose = _pendingNativeClose;
+      if (pendingClose != null) {
+        _debugLogService?.info(
+          'Waiting for the previous USB port close to finish before reopening',
+          tag: 'USB Serial',
+        );
+        try {
+          await pendingClose;
+        } catch (_) {
+          // Failures are already logged by the close path.
+        }
+      }
+
       try {
         bindings.fl_free();
         bindings.fl_init(16);
@@ -424,6 +442,17 @@ class UsbSerialService {
     }
     try {
       await serial.onSerialData.close();
+    } catch (_) {
+      // Ignore errors while releasing Dart-side resources.
+    }
+    _releaseSerialBuffers(serial);
+  }
+
+  /// Frees the two calloc'd I/O buffers `openPort()` allocated and clears the
+  /// pointer fields. `FlSerial.closePort()` frees them too but leaves the
+  /// fields dangling, so clearing is what makes a second release safe.
+  void _releaseSerialBuffers(FlSerial serial) {
+    try {
       if (serial.serialReadBuff.address != 0) {
         calloc.free(serial.serialReadBuff);
         serial.serialReadBuff = Pointer.fromAddress(0);
@@ -443,25 +472,29 @@ class UsbSerialService {
     // disconnect() path via unawaited() offers no ordering guarantee — the
     // isolate may die before the Future resolves, leaving the thread alive
     // with a dangling NativeCallable pointer.
-    //
-    // When a close is already in flight there is nothing left to do
-    // synchronously: `fl_close()` sets `breakThread` and joins the
-    // SerialThread *before* it reaches the blocking `::close()`, so the
-    // thread — and with it the NativeCallable — is already gone while the
-    // helper isolate waits out the kernel's closing_wait.
-    if (_useDesktopFlSerial && _pendingNativeClose == null) {
+    final pendingClose = _pendingNativeClose;
+    if (pendingClose != null) {
+      // A disconnect is already running and owns the teardown ordering
+      // (native close first, subscription cancel after). Re-entering
+      // disconnect() here would cancel the subscription underneath it, so
+      // only chain the frame-controller cleanup onto that close.
+      unawaited(pendingClose.whenComplete(_closeFrameController));
+      return;
+    }
+    if (_useDesktopFlSerial) {
       final serial = _serial;
       _serial = null;
-      try {
-        if (serial != null && serial.isOpen() == FlOpenStatus.open) {
-          serial.setDTR(false);
-          serial.closePort(); // synchronous C call — kills the SerialThread
-        }
-      } catch (_) {}
-      // closePort() frees both I/O buffers but leaves the pointer fields
-      // dangling; clear them so nothing can free them a second time.
-      serial?.serialReadBuff = Pointer.fromAddress(0);
-      serial?.serialWriteBuff = Pointer.fromAddress(0);
+      if (serial != null) {
+        try {
+          if (serial.isOpen() == FlOpenStatus.open) {
+            serial.setDTR(false);
+            serial.closePort(); // synchronous C call — kills the SerialThread
+          }
+        } catch (_) {}
+        // Free (or, after closePort(), just clear) the I/O buffers here:
+        // _serial is gone, so the disconnect() below can no longer reach them.
+        _releaseSerialBuffers(serial);
+      }
     }
     // Kick off the full async teardown for anything else (subscription cancel,
     // stream controller close). These are best-effort at dispose time.
@@ -469,6 +502,12 @@ class UsbSerialService {
   }
 
   void _handleSerialData(FlSerialEventArgs event) {
+    if (_status != UsbSerialStatus.connected) {
+      // Teardown already invalidated the native handle; a callback queued
+      // before that would make readList() throw and publish a spurious
+      // transport error that triggers another disconnect.
+      return;
+    }
     try {
       final bytes = event.serial.readList();
       if (bytes.isNotEmpty) {
