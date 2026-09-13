@@ -144,6 +144,13 @@ class UsbSerialService {
       } catch (_) {
         // Failures are already logged by the teardown path.
       }
+
+      // The await above is a suspension point: another caller may have claimed
+      // the transport while this one waited.
+      if (_status == UsbSerialStatus.connected ||
+          _status == UsbSerialStatus.connecting) {
+        throw StateError('USB serial transport is already active');
+      }
     }
 
     _status = UsbSerialStatus.connecting;
