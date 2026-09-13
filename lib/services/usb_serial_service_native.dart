@@ -35,8 +35,9 @@ class UsbSerialService {
   String? _connectedPortKey;
   String? _connectedPortLabel;
   FlSerial? _serial;
-  /// Non-null while the native port is being closed in a helper isolate.
-  Future<void>? _pendingNativeClose;
+  /// Non-null while a disconnect teardown (native close in a helper isolate,
+  /// then subscription cancel) is running.
+  Future<void>? _activeDisconnect;
   AppDebugLogService? _debugLogService;
   Object? _lastError;
 
@@ -162,21 +163,22 @@ class UsbSerialService {
       //
       // This must happen before we register any new NativeCallable, so it must
       // be the very first thing we do in the desktop branch.
-      // A previous close may still be running in its helper isolate (the
-      // kernel can hold close(2) for closing_wait). fl_close() and fl_free()
-      // mutate the same process-global flserial_tab, so opening — and
-      // especially resetting — the table now would race the helper and could
-      // double-close the old slot or kill the freshly opened one.
-      final pendingClose = _pendingNativeClose;
-      if (pendingClose != null) {
+      // A previous disconnect may still be running: its native close waits out
+      // the kernel's closing_wait in a helper isolate, and it only marks the
+      // transport disconnected afterwards. fl_close() and fl_free() mutate the
+      // same process-global flserial_tab, so reopening now could race the
+      // helper, and the old teardown could later overwrite the new connection
+      // state. Wait for the whole teardown, not just the native close.
+      final pendingDisconnect = _activeDisconnect;
+      if (pendingDisconnect != null) {
         _debugLogService?.info(
-          'Waiting for the previous USB port close to finish before reopening',
+          'Waiting for the previous USB disconnect to finish before reopening',
           tag: 'USB Serial',
         );
         try {
-          await pendingClose;
+          await pendingDisconnect;
         } catch (_) {
-          // Failures are already logged by the close path.
+          // Failures are already logged by the teardown path.
         }
       }
 
@@ -312,8 +314,23 @@ class UsbSerialService {
     }
   }
 
-  Future<void> disconnect() async {
-    if (_status == UsbSerialStatus.disconnected) return;
+  /// Tears the transport down. Re-entrant calls (e.g. the `onDone` handler
+  /// firing while a disconnect is already running) join the in-flight
+  /// teardown instead of racing it.
+  Future<void> disconnect() {
+    final pending = _activeDisconnect;
+    if (pending != null) return pending;
+    if (_status == UsbSerialStatus.disconnected) return Future<void>.value();
+    final teardown = _disconnectInternal();
+    _activeDisconnect = teardown;
+    return teardown.whenComplete(() {
+      if (identical(_activeDisconnect, teardown)) {
+        _activeDisconnect = null;
+      }
+    });
+  }
+
+  Future<void> _disconnectInternal() async {
 
     final portLabel = _connectedPortLabel ?? _connectedPortKey;
     _debugLogService?.info(
@@ -350,15 +367,7 @@ class UsbSerialService {
         // Ignore errors while closing.
       }
       if (serial != null) {
-        final pending = _closePortOffUiIsolate(serial);
-        _pendingNativeClose = pending;
-        try {
-          await pending;
-        } finally {
-          if (identical(_pendingNativeClose, pending)) {
-            _pendingNativeClose = null;
-          }
-        }
+        await _closePortOffUiIsolate(serial);
       }
       // Note: we do NOT call free() here; that would globally reset native
       // state for all ports. The global reset is done in connect() instead,
@@ -449,18 +458,21 @@ class UsbSerialService {
   }
 
   /// Frees the two calloc'd I/O buffers `openPort()` allocated and clears the
-  /// pointer fields. `FlSerial.closePort()` frees them too but leaves the
-  /// fields dangling, so clearing is what makes a second release safe.
-  void _releaseSerialBuffers(FlSerial serial) {
+  /// pointer fields.
+  ///
+  /// [alreadyFreed] is set when `FlSerial.closePort()` ran: it frees both
+  /// buffers itself but leaves the pointer fields dangling, so they must only
+  /// be cleared, never freed again.
+  void _releaseSerialBuffers(FlSerial serial, {bool alreadyFreed = false}) {
     try {
-      if (serial.serialReadBuff.address != 0) {
+      if (!alreadyFreed && serial.serialReadBuff.address != 0) {
         calloc.free(serial.serialReadBuff);
-        serial.serialReadBuff = Pointer.fromAddress(0);
       }
-      if (serial.serialWriteBuff.address != 0) {
+      serial.serialReadBuff = Pointer.fromAddress(0);
+      if (!alreadyFreed && serial.serialWriteBuff.address != 0) {
         calloc.free(serial.serialWriteBuff);
-        serial.serialWriteBuff = Pointer.fromAddress(0);
       }
+      serial.serialWriteBuff = Pointer.fromAddress(0);
     } catch (_) {
       // Ignore errors while releasing Dart-side resources.
     }
@@ -472,28 +484,38 @@ class UsbSerialService {
     // disconnect() path via unawaited() offers no ordering guarantee — the
     // isolate may die before the Future resolves, leaving the thread alive
     // with a dangling NativeCallable pointer.
-    final pendingClose = _pendingNativeClose;
-    if (pendingClose != null) {
+    final pendingDisconnect = _activeDisconnect;
+    if (pendingDisconnect != null) {
       // A disconnect is already running and owns the teardown ordering
       // (native close first, subscription cancel after). Re-entering
       // disconnect() here would cancel the subscription underneath it, so
-      // only chain the frame-controller cleanup onto that close.
-      unawaited(pendingClose.whenComplete(_closeFrameController));
+      // only chain the frame-controller cleanup onto that teardown.
+      unawaited(pendingDisconnect.whenComplete(_closeFrameController));
       return;
     }
     if (_useDesktopFlSerial) {
       final serial = _serial;
       _serial = null;
       if (serial != null) {
-        try {
-          if (serial.isOpen() == FlOpenStatus.open) {
+        // Close on any live handle, not only when isOpen() reports `open`:
+        // flserial keeps a valid slot (and a running SerialThread) when the
+        // port is in an I/O error state, and _serial is already unreachable.
+        var closed = false;
+        if (serial.flh >= 0) {
+          try {
             serial.setDTR(false);
-            serial.closePort(); // synchronous C call — kills the SerialThread
+          } catch (_) {
+            // Line-control failure must not skip the close below.
           }
-        } catch (_) {}
-        // Free (or, after closePort(), just clear) the I/O buffers here:
-        // _serial is gone, so the disconnect() below can no longer reach them.
-        _releaseSerialBuffers(serial);
+          try {
+            serial.closePort(); // synchronous C call — kills the SerialThread
+            closed = true;
+          } catch (_) {}
+        }
+        // _serial is gone, so the disconnect() below can no longer reach the
+        // buffers: release them here, or just clear the dangling pointers if
+        // closePort() already freed them.
+        _releaseSerialBuffers(serial, alreadyFreed: closed);
       }
     }
     // Kick off the full async teardown for anything else (subscription cancel,
