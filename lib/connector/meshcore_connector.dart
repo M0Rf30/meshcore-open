@@ -188,12 +188,14 @@ class MeshCoreConnector extends ChangeNotifier {
   String? _lastDeviceId;
   String? _lastDeviceDisplayName;
   bool _manualDisconnect = false;
+
   /// Non-null while [disconnect] is tearing the transport down. Connect paths
   /// join it so a teardown cannot finish after a new connection and reset the
   /// state to `disconnected`. USB made this reachable: its native close now
   /// waits out the kernel's closing_wait off the UI isolate, so the teardown
   /// can outlive the tap that starts the next connection.
   Future<void>? _activeDisconnect;
+
   /// Set by [dispose]. A teardown started before disposal can still be running
   /// (the USB native close waits out the kernel's closing_wait off the UI
   /// isolate), so state publication is suppressed once the connector is gone.

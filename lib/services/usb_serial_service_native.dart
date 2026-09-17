@@ -35,6 +35,7 @@ class UsbSerialService {
   String? _connectedPortKey;
   String? _connectedPortLabel;
   FlSerial? _serial;
+
   /// Non-null while a disconnect teardown (native close in a helper isolate,
   /// then subscription cancel) is running.
   Future<void>? _activeDisconnect;
@@ -341,7 +342,6 @@ class UsbSerialService {
   }
 
   Future<void> _disconnectInternal() async {
-
     final portLabel = _connectedPortLabel ?? _connectedPortKey;
     _debugLogService?.info(
       'USB disconnect starting port=${portLabel ?? 'unknown'}',
